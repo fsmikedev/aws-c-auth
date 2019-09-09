@@ -18,6 +18,8 @@
 #include <aws/auth/external/cJSON.h>
 #include <aws/auth/private/credentials_utils.h>
 #include <aws/common/clock.h>
+#include <aws/common/condition_variable.h>
+#include <aws/common/mutex.h>
 #include <aws/common/string.h>
 #include <aws/http/connection.h>
 #include <aws/http/connection_manager.h>
@@ -37,6 +39,10 @@
 struct aws_credentials_provider_imds_impl {
     struct aws_http_connection_manager *connection_manager;
     struct aws_credentials_provider_imds_function_table *function_table;
+
+    bool shutdown_complete;
+    struct aws_mutex shutdown_lock;
+    struct aws_condition_variable shutdown_signal;
 };
 
 static struct aws_credentials_provider_imds_function_table s_default_function_table = {
@@ -522,6 +528,29 @@ error:
     return AWS_OP_ERR;
 }
 
+static void s_imds_credentials_provider_connection_manager_shutdown_complete_fn(void *user_data) {
+    struct aws_credentials_provider *provider = user_data;
+    struct aws_credentials_provider_imds_impl *impl = provider->impl;
+
+    aws_mutex_lock(&impl->shutdown_lock);
+    impl->shutdown_complete = true;
+    aws_mutex_unlock(&impl->shutdown_lock);
+    aws_condition_variable_notify_one(&impl->shutdown_signal);
+}
+
+static bool s_has_imds_shutdown_completed(void *user_data) {
+    struct aws_credentials_provider_imds_impl *impl = user_data;
+
+    return impl->shutdown_complete;
+}
+
+static void s_wait_on_shutdown_complete(struct aws_credentials_provider_imds_impl *impl) {
+
+    aws_mutex_lock(&impl->shutdown_lock);
+    aws_condition_variable_wait_pred(&impl->shutdown_signal, &impl->shutdown_lock, s_has_imds_shutdown_completed, impl);
+    aws_mutex_unlock(&impl->shutdown_lock);
+}
+
 static void s_credentials_provider_imds_clean_up(struct aws_credentials_provider *provider) {
     struct aws_credentials_provider_imds_impl *impl = provider->impl;
     if (impl == NULL) {
@@ -529,6 +558,8 @@ static void s_credentials_provider_imds_clean_up(struct aws_credentials_provider
     }
 
     impl->function_table->aws_http_connection_manager_release(impl->connection_manager);
+
+    s_wait_on_shutdown_complete(impl);
 }
 
 static struct aws_credentials_provider_vtable s_aws_credentials_provider_imds_vtable = {
@@ -560,6 +591,14 @@ struct aws_credentials_provider *aws_credentials_provider_new_imds(
 
     aws_credentials_provider_init_base(provider, allocator, &s_aws_credentials_provider_imds_vtable, impl);
 
+    if (aws_mutex_init(&impl->shutdown_lock)) {
+        goto on_error;
+    }
+
+    if (aws_condition_variable_init(&impl->shutdown_signal)) {
+        goto on_error;
+    }
+
     struct aws_socket_options socket_options;
     AWS_ZERO_STRUCT(socket_options);
     socket_options.type = AWS_SOCKET_STREAM;
@@ -576,6 +615,8 @@ struct aws_credentials_provider *aws_credentials_provider_new_imds(
     manager_options.host = aws_byte_cursor_from_string(s_imds_host);
     manager_options.port = 80;
     manager_options.max_connections = 2;
+    manager_options.shutdown_complete_user_data = provider;
+    manager_options.shutdown_complete_callback = s_imds_credentials_provider_connection_manager_shutdown_complete_fn;
 
     impl->function_table = options->function_table;
     if (impl->function_table == NULL) {
