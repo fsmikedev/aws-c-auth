@@ -124,7 +124,7 @@ else()
 endif()
 
 install(EXPORT "${CMAKE_PROJECT_NAME}-targets"
-        DESTINATION "${LIBRARY_DIRECTORY}/${CMAKE_PROJECT_NAME}/cmake/${TARGET_DIR}/"
+        DESTINATION "${LIBRARY_DIRECTORY}/${CMAKE_PROJECT_NAME}/cmake/"
         NAMESPACE AWS::
         COMPONENT Development)
 
